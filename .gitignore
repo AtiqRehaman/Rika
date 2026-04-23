@@ -1,0 +1,9 @@
+chroma_db/
+*.gguf
+*.bin
+__pycache__/
+*.pyc
+.env
+models/
+uploads/
+*.log
