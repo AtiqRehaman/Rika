@@ -80,20 +80,36 @@ async def ingest(file: UploadFile = File(...)):
 async def query(req: QueryRequest):
     answer, sources = orchestrator.query(req.question, top_k_rerank=req.top_k)
     return {
-        "answer": answer,
+        "answer": answer,   # newlines here are fine — JSON encodes them as \n automatically
         "sources": [s["metadata"].get("source") for s in sources],
         "chunks_used": len(sources),
     }
 
+    
 @app.post("/stream")
 async def stream(req: QueryRequest):
     generator, _ = orchestrator.query(req.question, stream=True)
+
     def event_stream():
         for token in generator:
-            yield f"data: {token}\n\n"
+            if not token:
+                continue
+            # CRITICAL: escape real newlines inside tokens.
+            # SSE uses \n\n as event separator — a raw \n in a token
+            # breaks the frame and corrupts the stream into one line.
+            safe = token.replace("\\", "\\\\").replace("\n", "\\n")
+            yield f"data: {safe}\n\n"
         yield "data: [DONE]\n\n"
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",    # stops Cloudflare buffering tokens
+            "Connection":        "keep-alive",
+        }
+    )
 # ── Cloudflare Tunnel (no login needed) ────────────────────
 def start_cloudflare(port: int = 8000):
     """Starts cloudflared quick tunnel and extracts the public URL."""

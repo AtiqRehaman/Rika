@@ -22,6 +22,7 @@ class PromptBuilder:
 
     def build(self, query: str, retrieved: List[Dict[str, Any]]) -> str:
         system = (
+            "You are Rika."
             "You are an expert coding assistant specializing in TensorFlow and PyTorch. "
             "Answer questions using ONLY the provided context. "
             "If the context doesn't contain the answer, say so clearly. "
