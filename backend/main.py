@@ -391,29 +391,60 @@ async def stream(req: QueryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ══════════════════════════════════════════════════════════
-# CLOUDFLARE TUNNEL
+# NGROK TUNNEL (replaces Cloudflare)
 # ══════════════════════════════════════════════════════════
-def start_cloudflare(port: int = 8000):
-    if not os.path.exists("/usr/local/bin/cloudflared"):
-        print("      Downloading cloudflared...")
+def start_ngrok(port: int = 8000):
+    """
+    Start ngrok tunnel and return the public URL.
+    Requires ngrok authtoken set in environment variable NGROK_AUTHTOKEN.
+    """
+    # Check if ngrok is installed
+    if not os.path.exists("/usr/local/bin/ngrok"):
+        print("      Downloading ngrok...")
         os.system(
-            "wget -q https://github.com/cloudflare/cloudflared/releases/latest/"
-            "download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared "
-            "&& chmod +x /usr/local/bin/cloudflared"
+            "wget -q https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.zip "
+            "-O /tmp/ngrok.zip && unzip -q /tmp/ngrok.zip -d /usr/local/bin/ && "
+            "chmod +x /usr/local/bin/ngrok"
         )
+    
+    # Get auth token from environment
+    auth_token = os.environ.get("NGROK_AUTHTOKEN")
+    if not auth_token:
+        print("      ⚠️  NGROK_AUTHTOKEN not set in environment")
+        print("      Get your token from https://dashboard.ngrok.com/get-started/your-authtoken")
+        print("      Set it as: os.environ['NGROK_AUTHTOKEN'] = 'your_token'")
+        return None, None
+    
+    # Configure auth token
+    subprocess.run(["ngrok", "config", "add-authtoken", auth_token], 
+                   capture_output=True, text=True)
+    
+    # Start ngrok tunnel
     proc = subprocess.Popen(
-        ["cloudflared", "tunnel", "--url", f"http://localhost:{port}"],
+        ["ngrok", "http", str(port), "--log=stdout"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
+    
+    # Wait for URL
     url = None
+    import json
     for line in proc.stdout:
-        print(f"      [cloudflare] {line.strip()}")
-        match = re.search(r"https://[a-z0-9\-]+\.trycloudflare\.com", line)
-        if match:
-            url = match.group(0)
-            break
+        print(f"      [ngrok] {line.strip()}")
+        # ngrok logs JSON lines - look for the URL
+        try:
+            data = json.loads(line)
+            if data.get("msg") == "started tunnel" and "url" in data:
+                url = data["url"]
+                break
+        except json.JSONDecodeError:
+            # Fallback: look for URL in plain text output
+            match = re.search(r"https://[a-z0-9\-]+\.ngrok\.io", line)
+            if match:
+                url = match.group(0)
+                break
+    
     return proc, url
 
 # ══════════════════════════════════════════════════════════
@@ -429,8 +460,8 @@ if __name__ == "__main__":
     time.sleep(3)
     print("      Server running on port 8000 ✓")
 
-    print("[4/4] Opening Cloudflare tunnel...")
-    cf_proc, public_url = start_cloudflare(port=8000)
+    print("[4/4] Opening ngrok tunnel...")
+    ngrok_proc, public_url = start_ngrok(port=8000)
 
     if public_url:
         print(f"\n{'='*55}")
@@ -438,7 +469,8 @@ if __name__ == "__main__":
         print(f"  ⚠️  Update src/config.js with this URL")
         print(f"{'='*55}\n")
     else:
-        print("✗ Could not get tunnel URL — check cloudflare logs above")
+        print("✗ Could not get tunnel URL — check ngrok logs above")
+        print("  Make sure NGROK_AUTHTOKEN is set in environment")
 
     try:
         while True:
@@ -446,4 +478,5 @@ if __name__ == "__main__":
             print("  ✓ Server alive...")
     except KeyboardInterrupt:
         print("Shutting down...")
-        cf_proc.terminate()
+        if ngrok_proc:
+            ngrok_proc.terminate()
