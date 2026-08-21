@@ -127,12 +127,17 @@ def _init_rag():
 def _init_supabase():
     global db
     print("[3/3] Connecting Supabase…", flush=True)
-    url = os.environ.get("SUPABASE_URL","").strip()
-    key = os.environ.get("SUPABASE_KEY","").strip()
-    print(f"      URL={url[:40]!r}", flush=True)
-    print(f"      KEY={'set' if key else 'EMPTY'}", flush=True)
+    # Strip all whitespace — copy-paste from browser often adds trailing newlines
+    url = os.environ.get("SUPABASE_URL","").strip().replace("\n","").replace("\r","")
+    key = os.environ.get("SUPABASE_KEY","").strip().replace("\n","").replace("\r","")
+    print(f"      URL={url[:50]!r}", flush=True)
+    print(f"      KEY starts with: {key[:12]!r}...", flush=True)
     if not url or not key or "your-project" in url:
         print("      ⚠️  Supabase disabled — env vars missing", flush=True)
+        return
+    if not key.startswith("eyJ"):
+        print("      ⚠️  KEY looks wrong — anon key should start with 'eyJ'", flush=True)
+        print("         Get it from: supabase.com → project → Settings → API → anon/public", flush=True)
         return
     try:
         from supabase import create_client
