@@ -1,7 +1,8 @@
 # main.py  —  Rika RAG Backend
 # uvicorn main:app --host 0.0.0.0 --port 8000
+# NO CORS — frontend uses Vite proxy, all requests go to localhost
 
-import os, sys, uuid, shutil, mimetypes
+import os, sys, uuid, shutil, mimetypes, asyncio, threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -10,9 +11,7 @@ os.environ.setdefault("CHROMA_TELEMETRY",     "False")
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import uvicorn
 
 from llama_cpp import Llama
 from ingestion.document_loader import DocumentLoader
@@ -20,75 +19,30 @@ from ingestion.chunker import SmartChunker
 from retrieval.vector_store import VectorStore
 from rag.orchestrator import RAGOrchestrator
 
-# ══════════════════════════════════════════════════════════════════════
-# APP  +  CORS
-# The order matters: CORSMiddleware must be added FIRST.
-# We also add a manual middleware that stamps CORS on every response
-# including errors — because ngrok/Cloudflare error pages strip headers.
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+# APP  —  no CORS middleware at all
+# ══════════════════════════════════════════════════════════════════
 app = FastAPI(title="Rika RAG Assistant")
 
-# 1. Standard CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,   # must be False when origins=["*"]
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=600,
-)
-
-# 2. Manual fallback — stamps headers even on 4xx/5xx error responses
-@app.middleware("http")
-async def force_cors(request: Request, call_next):
-    # Handle preflight here too (belt-and-suspenders)
-    if request.method == "OPTIONS":
-        return JSONResponse(
-            content={},
-            headers={
-                "Access-Control-Allow-Origin":  "*",
-                "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
-                "Access-Control-Allow-Headers": "*",
-                "Access-Control-Max-Age":       "600",
-            }
-        )
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"]  = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PATCH,DELETE,OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    return response
-
-# 3. Explicit OPTIONS catch-all (some clients bypass middleware)
-@app.options("/{path:path}")
-async def options_handler(path: str):
-    return JSONResponse(content={}, headers={
-        "Access-Control-Allow-Origin":  "*",
-        "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
-        "Access-Control-Allow-Headers": "*",
-        "Access-Control-Max-Age":       "600",
-    })
-
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # MODELS
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 class QueryRequest(BaseModel):
     question:   str
     session_id: Optional[str] = None
     top_k:      int = 3
-    stream:     bool = False
 
 class SessionUpdate(BaseModel):
     title: str
 
-# ══════════════════════════════════════════════════════════════════════
-# GLOBALS — populated in lifespan
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+# GLOBALS
+# ══════════════════════════════════════════════════════════════════
 llm = vector_store = orchestrator = loader = chunker = db = None
 
-# ══════════════════════════════════════════════════════════════════════
-# LIFESPAN — all heavy init here so errors appear in uvicorn logs
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+# LIFESPAN
+# ══════════════════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _init_llm()
@@ -106,8 +60,9 @@ def _find_model():
         "/content/drive/MyDrive/models/glm-4-9b-chat-Q4_K_M.gguf",
     ]:
         if os.path.exists(p):
-            print(f"      Model: {p}", flush=True); return p
-    raise FileNotFoundError("GGUF not found — check model path")
+            print(f"      Model: {p}", flush=True)
+            return p
+    raise FileNotFoundError("GGUF not found")
 
 def _init_llm():
     global llm
@@ -127,30 +82,25 @@ def _init_rag():
 def _init_supabase():
     global db
     print("[3/3] Connecting Supabase…", flush=True)
-    # Strip all whitespace — copy-paste from browser often adds trailing newlines
-    url = os.environ.get("SUPABASE_URL","").strip().replace("\n","").replace("\r","")
-    key = os.environ.get("SUPABASE_KEY","").strip().replace("\n","").replace("\r","")
+    url = os.environ.get("SUPABASE_URL","").strip()
+    key = os.environ.get("SUPABASE_KEY","").strip()
     print(f"      URL={url[:50]!r}", flush=True)
-    print(f"      KEY starts with: {key[:12]!r}...", flush=True)
+    print(f"      KEY starts: {key[:14]!r}", flush=True)
     if not url or not key or "your-project" in url:
-        print("      ⚠️  Supabase disabled — env vars missing", flush=True)
-        return
+        print("      ⚠️  Supabase disabled", flush=True); return
     if not key.startswith("eyJ"):
-        print("      ⚠️  KEY looks wrong — anon key should start with 'eyJ'", flush=True)
-        print("         Get it from: supabase.com → project → Settings → API → anon/public", flush=True)
-        return
+        print("      ⚠️  KEY wrong format — get anon key from supabase.com → Settings → API", flush=True); return
     try:
         from supabase import create_client
         db = create_client(url, key)
         db.table("sessions").select("id").limit(1).execute()
         print("      Supabase ✓", flush=True)
     except Exception as e:
-        print(f"      Supabase failed: {e}", flush=True)
-        db = None
+        print(f"      Supabase failed: {e}", flush=True); db = None
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # DB HELPERS
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 def _save_msg(sid, role, content):
     if not db or not sid: return
     try:
@@ -177,13 +127,15 @@ def _upload(local, spath, mime):
                 file_options={"content-type": mime or "application/octet-stream"})
     except Exception as e: print(f"[db] upload: {e}")
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # ROUTES
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 @app.get("/health")
 def health():
-    return {"status":"ok","chunks":vector_store.collection_size() if vector_store else 0,
-            "supabase":db is not None,"llm":llm is not None}
+    return {"status":"ok",
+            "chunks": vector_store.collection_size() if vector_store else 0,
+            "supabase": db is not None,
+            "llm": llm is not None}
 
 # Sessions
 @app.post("/sessions")
@@ -284,7 +236,7 @@ async def query(req:QueryRequest):
                 "chunks_used":len(sources)}
     except Exception as e: raise HTTPException(500,str(e))
 
-# Stream
+# Stream  —  async generator + thread queue to avoid buffering
 @app.post("/stream")
 async def stream(req: QueryRequest):
     try:
@@ -295,67 +247,47 @@ async def stream(req: QueryRequest):
             _save_msg(req.session_id, "user", req.question)
 
         collected = []
+        loop      = asyncio.get_event_loop()
+        queue     = asyncio.Queue()
+
+        def _run():
+            try:
+                for token in generator:
+                    if token:
+                        loop.call_soon_threadsafe(queue.put_nowait, token)
+            except Exception as e:
+                loop.call_soon_threadsafe(queue.put_nowait, Exception(str(e)))
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        threading.Thread(target=_run, daemon=True).start()
 
         async def event_stream():
-            import asyncio
-
-            # Send an immediate comment ping so the tunnel knows the
-            # connection is alive before the LLM produces the first token.
-            # Cloudflare and ngrok both drop connections with no initial data.
+            # Immediate ping so proxy/tunnel knows connection is alive
             yield ": ping\n\n"
-
-            loop = asyncio.get_event_loop()
-
-            # Run the blocking llama-cpp generator in a thread so the async
-            # event loop stays free (avoids uvicorn timeout on slow inference)
-            token_queue = asyncio.Queue()
-
-            def _generate():
-                try:
-                    for token in generator:
-                        if token:
-                            loop.call_soon_threadsafe(token_queue.put_nowait, token)
-                except Exception as e:
-                    loop.call_soon_threadsafe(token_queue.put_nowait, Exception(str(e)))
-                finally:
-                    loop.call_soon_threadsafe(token_queue.put_nowait, None)  # sentinel
-
-            import threading
-            threading.Thread(target=_generate, daemon=True).start()
-
             while True:
                 try:
-                    token = await asyncio.wait_for(token_queue.get(), timeout=30.0)
+                    token = await asyncio.wait_for(queue.get(), timeout=30.0)
                 except asyncio.TimeoutError:
-                    # Send keep-alive ping every 30s so tunnel doesn't close
                     yield ": keep-alive\n\n"
                     continue
-
-                if token is None:           # sentinel — generation done
-                    break
+                if token is None: break
                 if isinstance(token, Exception):
-                    yield f"data: Error: {token}\n\n"
-                    break
-
+                    yield f"data: Error: {token}\n\n"; break
                 collected.append(token)
-                safe = token.replace("\\", "\\\\").replace("\n", "\\n")
+                safe = token.replace("\\","\\\\").replace("\n","\\n")
                 yield f"data: {safe}\n\n"
-
             yield "data: [DONE]\n\n"
-
             if req.session_id and collected:
-                _save_msg(req.session_id, "rika", "".join(collected))
+                _save_msg(req.session_id,"rika","".join(collected))
 
         return StreamingResponse(
             event_stream(),
             media_type="text/event-stream",
             headers={
-                "Access-Control-Allow-Origin":  "*",
-                "Access-Control-Allow-Headers": "*",
-                "Cache-Control":                "no-cache, no-transform",
-                "X-Accel-Buffering":            "no",
-                "Connection":                   "keep-alive",
+                "Cache-Control":     "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                "Connection":        "keep-alive",
             }
         )
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    except Exception as e: raise HTTPException(500, str(e))
