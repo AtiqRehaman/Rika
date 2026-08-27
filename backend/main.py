@@ -24,6 +24,25 @@ from rag.orchestrator import RAGOrchestrator
 # ══════════════════════════════════════════════════════════════════
 app = FastAPI(title="Rika RAG Assistant")
 
+# Global exception handler — prevents uvicorn from dying on errors
+from fastapi.responses import JSONResponse as _JR
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+@app.exception_handler(StarletteHTTPException)
+async def http_handler(request: Request, exc: StarletteHTTPException):
+    return _JR({"detail": exc.detail}, status_code=exc.status_code)
+
+@app.exception_handler(RequestValidationError)
+async def validation_handler(request: Request, exc: RequestValidationError):
+    return _JR({"detail": str(exc)}, status_code=422)
+
+@app.exception_handler(Exception)
+async def generic_handler(request: Request, exc: Exception):
+    print(f"[ERROR] Unhandled exception: {exc}", flush=True)
+    import traceback; traceback.print_exc()
+    return _JR({"detail": str(exc)}, status_code=500)
+
 # ══════════════════════════════════════════════════════════════════
 # MODELS
 # ══════════════════════════════════════════════════════════════════
@@ -236,7 +255,7 @@ async def query(req:QueryRequest):
                 "chunks_used":len(sources)}
     except Exception as e: raise HTTPException(500,str(e))
 
-# Stream  —  async generator + thread queue to avoid buffering
+# Stream  —  async generator with correct loop/thread pattern
 @app.post("/stream")
 async def stream(req: QueryRequest):
     try:
@@ -247,39 +266,52 @@ async def stream(req: QueryRequest):
             _save_msg(req.session_id, "user", req.question)
 
         collected = []
-        loop      = asyncio.get_event_loop()
-        queue     = asyncio.Queue()
+        # get_running_loop() is correct in async context (not get_event_loop())
+        loop  = asyncio.get_running_loop()
+        queue = asyncio.Queue()
 
         def _run():
+            """Runs in a background thread — pushes tokens into the async queue."""
             try:
                 for token in generator:
                     if token:
                         loop.call_soon_threadsafe(queue.put_nowait, token)
             except Exception as e:
-                loop.call_soon_threadsafe(queue.put_nowait, Exception(str(e)))
+                loop.call_soon_threadsafe(queue.put_nowait, ("__error__", str(e)))
             finally:
-                loop.call_soon_threadsafe(queue.put_nowait, None)
+                loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
 
         threading.Thread(target=_run, daemon=True).start()
 
         async def event_stream():
-            # Immediate ping so proxy/tunnel knows connection is alive
+            # Immediate comment line — keeps tunnel alive before first token
             yield ": ping\n\n"
+
             while True:
                 try:
                     token = await asyncio.wait_for(queue.get(), timeout=30.0)
                 except asyncio.TimeoutError:
+                    # keep-alive comment — ignored by SSE parsers
                     yield ": keep-alive\n\n"
                     continue
-                if token is None: break
-                if isinstance(token, Exception):
-                    yield f"data: Error: {token}\n\n"; break
+
+                if token is None:
+                    # Sentinel — generation finished cleanly
+                    break
+
+                if isinstance(token, tuple) and token[0] == "__error__":
+                    yield f"data: [ERROR] {token[1]}\n\n"
+                    break
+
                 collected.append(token)
-                safe = token.replace("\\","\\\\").replace("\n","\\n")
+                # Escape backslashes first, then newlines
+                safe = token.replace("\\", "\\\\").replace("\n", "\\n")
                 yield f"data: {safe}\n\n"
+
             yield "data: [DONE]\n\n"
+
             if req.session_id and collected:
-                _save_msg(req.session_id,"rika","".join(collected))
+                _save_msg(req.session_id, "rika", "".join(collected))
 
         return StreamingResponse(
             event_stream(),
@@ -290,4 +322,5 @@ async def stream(req: QueryRequest):
                 "Connection":        "keep-alive",
             }
         )
-    except Exception as e: raise HTTPException(500, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
