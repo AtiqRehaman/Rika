@@ -286,37 +286,76 @@ async def query(req:QueryRequest):
 
 # Stream
 @app.post("/stream")
-async def stream(req:QueryRequest):
+async def stream(req: QueryRequest):
     try:
         result    = orchestrator.query(req.question, stream=True)
-        generator = result[0] if isinstance(result,tuple) else result
+        generator = result[0] if isinstance(result, tuple) else result
+
         if req.session_id:
-            _save_msg(req.session_id,"user",req.question)
+            _save_msg(req.session_id, "user", req.question)
+
         collected = []
 
-        def event_stream():
-            for token in generator:
-                if not token: continue
+        async def event_stream():
+            import asyncio
+
+            # Send an immediate comment ping so the tunnel knows the
+            # connection is alive before the LLM produces the first token.
+            # Cloudflare and ngrok both drop connections with no initial data.
+            yield ": ping\n\n"
+
+            loop = asyncio.get_event_loop()
+
+            # Run the blocking llama-cpp generator in a thread so the async
+            # event loop stays free (avoids uvicorn timeout on slow inference)
+            token_queue = asyncio.Queue()
+
+            def _generate():
+                try:
+                    for token in generator:
+                        if token:
+                            loop.call_soon_threadsafe(token_queue.put_nowait, token)
+                except Exception as e:
+                    loop.call_soon_threadsafe(token_queue.put_nowait, Exception(str(e)))
+                finally:
+                    loop.call_soon_threadsafe(token_queue.put_nowait, None)  # sentinel
+
+            import threading
+            threading.Thread(target=_generate, daemon=True).start()
+
+            while True:
+                try:
+                    token = await asyncio.wait_for(token_queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    # Send keep-alive ping every 30s so tunnel doesn't close
+                    yield ": keep-alive\n\n"
+                    continue
+
+                if token is None:           # sentinel — generation done
+                    break
+                if isinstance(token, Exception):
+                    yield f"data: Error: {token}\n\n"
+                    break
+
                 collected.append(token)
-                safe = token.replace("\\","\\\\").replace("\n","\\n")
+                safe = token.replace("\\", "\\\\").replace("\n", "\\n")
                 yield f"data: {safe}\n\n"
+
             yield "data: [DONE]\n\n"
+
             if req.session_id and collected:
-                _save_msg(req.session_id,"rika","".join(collected))
+                _save_msg(req.session_id, "rika", "".join(collected))
 
         return StreamingResponse(
             event_stream(),
             media_type="text/event-stream",
             headers={
-                # Explicit headers on the stream response itself —
-                # middleware headers can be lost when streaming
                 "Access-Control-Allow-Origin":  "*",
                 "Access-Control-Allow-Headers": "*",
                 "Cache-Control":                "no-cache, no-transform",
                 "X-Accel-Buffering":            "no",
                 "Connection":                   "keep-alive",
-                # ngrok free tier browser warning bypass
-                "ngrok-skip-browser-warning":   "true",
             }
         )
-    except Exception as e: raise HTTPException(500,str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
